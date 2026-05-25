@@ -2,11 +2,7 @@
 
 ## 1. Overview
 
-Nisbah Learning is a **web-only** two-sided marketplace connecting students with Islamic teachers for paid one-on-one lessons (Quran, Hadith, Arabic, Fiqh, Usul, Aqidah). Students discover teachers, negotiate a contract, pay on a recurring monthly schedule, attend live video sessions, review AI-generated session transcripts, and read uploaded materials. Teachers list themselves, run sessions, and receive biweekly payouts net of platform commission. Admins resolve vetting edge cases, flagged messages, and disputes.
-
-The system is deliberately sized for **product validation**, not scale: 300 MAU, ~100 video-hours/month. The architecture is a **modular monolith** (Node.js + TypeScript) on a **single VM behind Nginx**, leaning on managed services (Supabase, Stripe, Daily.co for video, AWS S3 + CloudFront) so the team writes business logic, not infrastructure.
-
-**Out of scope:** native mobile apps; the automated vetting *algorithm* (the pipeline boundary and status machine are designed, the scoring logic is TBD); group/multi-party classes; in-house video infrastructure; cloud recording of sessions (replaced by **opt-in AI transcripts**, see [Section 2.1](#21-functional-requirements)). Pricing — **flat 25 % commission; no platform subscription fee; no cap on concurrent contracts per student** — is now fixed ([Section 2.1](#21-functional-requirements)).
+Nisbah Learning is a **web-only** two-sided marketplace connecting students with Islamic teachers for paid one-on-one lessons (Quran, Hadith, Arabic, Fiqh, Usul, Aqidah). Students discover teachers, negotiate a contract, pay on a recurring monthly schedule, attend live video sessions, review opt-in session recordings, and read uploaded materials. Teachers list themselves, run sessions, and receive biweekly payouts net of platform commission. Admins resolve vetting edge cases, flagged messages, and disputes.
 
 ## 2. Requirements
 
@@ -23,16 +19,16 @@ The system is deliberately sized for **product validation**, not scale: 300 MAU,
 - **Materials.** Teachers upload books/PDFs; students **view them in-app only — no download** — while the contract is active.
 - **Sessions, timezones, rescheduling.** Sessions are a **fixed 1 hour**. Times stored in UTC, displayed in viewer-local time with the teacher's original local time in brackets (`Mon 3:00 PM EST (originally 8:00 PM PKT)`). Students may request out-of-availability times; teacher accepts or counters. Cancel/reschedule requires ≥24 h notice; rescheduled into the same or following week.
 - **Hours tracking.** Every delivered 1-hour session is tracked so the platform can (a) confirm the contracted number of sessions is completed within each contract and (b) accumulate `teacher_profiles.delivered_hours_total` for future teacher-time milestones (see [Section 8](#8-future-considerations)).
-- **Transcripts.** Transcription is **opt-in per contract**, **default off**. Either participant can toggle `transcription_enabled` from the contract view between sessions; the state at session start time is the state used for that session. When **on**, the session is transcribed by **Daily.co's built-in AI transcription** (Deepgram-backed, `enable_transcription: true` on the room) and speaker-labelled, timestamped transcripts are produced; when **off**, transcription is disabled at the room level — no audio leaves Daily for Deepgram, no transcript is produced, no transcription cost is incurred. There is no video recording in either mode. For sessions that *were* transcribed: transcripts are stored as text in Postgres, available to both parties **for the lifetime of the contract**, locked (not deleted) while a contract is `paused`, and purged on `completed`/`cancelled`. The setting is visible on the contract page and in the pre-session lobby so both parties always know whether the upcoming session will be transcribed.
+- **Recordings.** Recording is **opt-in per contract**, **default off**. Either participant can toggle `recording_enabled` from the contract view between sessions; the state at session start time is the state used for that session. When **on**, the session is recorded by **Daily.co's cloud recording** (`enable_recording: true` on the room); on session end the recording-ready webhook lands the file in **our S3** and writes a metadata row, and the recording is offered **view-only via a CloudFront signed URL** (no download). When **off**, recording is disabled at the room level — nothing is captured and no recording cost is incurred. For sessions that *were* recorded: recordings are available to both parties **for the lifetime of the contract**, locked (not deleted) while a contract is `paused`, and purged on `completed`/`cancelled`. The setting is visible on the contract page and in the pre-session lobby so both parties always know whether the upcoming session will be recorded.
 - **Transactional email.** Three business triggers, all sent through **Resend** as the single provider: (1) **contract established** → email to the student with the contract details **and** the amount charged / to be charged; (2) **teacher payout sent** (via Stripe) → email to the teacher; (3) **a student approaches a teacher for a contract** → email to the teacher. Supabase Auth additionally delivers its own auth emails (verification, password reset, magic link) via Resend SMTP, so every outbound email shares one domain, one set of DKIM/SPF/DMARC records, and one set of delivery logs.
 
 ### 2.2 Non-Functional Requirements
 
 - **Scale.** **300 total users = 200 students + 100 teachers**; ~**200 one-on-one video-hours/month**. Single VM is sufficient; no horizontal scaling required.
 - **Durability & consistency.** Contracts and payments require full **ACID** — handled via Postgres transactions and Stripe as the system of record for money; payment state changes are idempotent against Stripe webhook IDs.
-- **Transcripts retention.** Transcript text retained in Postgres for the contract lifetime; deleted when the contract reaches `completed` or `cancelled`. No S3 involvement (transcripts are kilobytes of text, not media).
+- **Recordings retention.** Recording media held in S3 Standard with a metadata row in Postgres for the contract lifetime; both purged when the contract reaches `completed` or `cancelled`. Footprint is bounded by purge-on-terminal (no indefinite media accumulation).
 - **Availability.** Best-effort single-VM (~99% — SPOF accepted at this stage). RTO of minutes-to-hours via daily VM image rebuild; **RPO for business data is effectively zero** because all durable state lives in Supabase / S3 / Stripe, not on the VM.
-- **Security.** TLS at Nginx; private media (contract PDFs, student photos) served only via short-lived **CloudFront signed URLs** minted after an authz check, buckets locked down with Origin Access Control; **materials are view-only / non-downloadable** (signed URLs delivered with inline content-disposition into an in-app viewer that disables download); transcript and student-profile access enforced by Supabase Row-Level Security; secrets in environment, not image.
+- **Security.** TLS at Nginx; private media (contract PDFs, student photos, session recordings) served only via short-lived **CloudFront signed URLs** minted after an authz check, buckets locked down with Origin Access Control; **materials and recordings are view-only / non-downloadable** (signed URLs delivered with inline content-disposition into an in-app viewer/player that disables download); recording-metadata and student-profile access enforced by Supabase Row-Level Security; secrets in environment, not image.
 - **Observability.** At this scale there is **nothing dedicated to build for observability** — the platform relies on the host/managed-service default logs (Supabase, Stripe dashboard, the VM's container logs). A purpose-built observability stack is unjustified at 300 users.
 
 ### 2.3 Contract Lifecycle
@@ -58,7 +54,7 @@ A request/proposal is **not** a committed contract row — during negotiation it
 7. **Schedule.** The student books **all sessions upfront**, and may later **reschedule in the UI** (the ≥24 h-notice rule applies). **Rescheduling never changes payment.**
 8. **Deliver.** Sessions run over the term; every delivered 1-hour session is tracked (hours tracking).
 9. **Completion (time-based).** Driven by the same tracked-time variable used for teacher hours. When the contract's full contracted time is consumed, **5 minutes after the last session ends** both parties get an **Extend / Complete** prompt that stays open for **5 minutes**. If **Extend** is not chosen within that window, the contract auto-sets to `COMPLETED`. **Extend** adds more sessions at the **same per-session rate**, paid immediately via the same payment option; an extension must itself be **≥4 sessions** (the minimum-length rule applies to extensions too). After completion, any further extension requires a **new contract**.
-10. **Terminal cleanup (on `COMPLETED`).** Recurring charges stop; **transcripts are purged**; the **student's access to materials is revoked**; the **teacher's uploaded textbook is retained in S3 Standard** (teacher-only access afterward).
+10. **Terminal cleanup (on `COMPLETED`).** Recurring charges stop; **recordings are purged**; the **student's access to materials is revoked**; the **teacher's uploaded textbook is retained in S3 Standard** (teacher-only access afterward).
 
 **Request expiry (pre-acceptance).** A request sits in the teacher's inbox for **7 days**: email on receipt, then reminders at **day 3**, **day 5**, and **day 7**. If still not actioned by **midnight in the teacher's local timezone** after the day-7 email, the request **expires** and the student is notified. The student may re-request **any number of times**.
 
@@ -72,7 +68,7 @@ A request/proposal is **not** a committed contract row — during negotiation it
 **Pause (`PAUSED`):**
 
 - **Either party** can pause **unilaterally**; a reason is encouraged but not mandatory.
-- **While paused, everything is locked except messaging** (video, transcripts, and materials are all locked).
+- **While paused, everything is locked except messaging** (video, recordings, and materials are all locked).
 - **Billing — two sub-cases.** *Pause with refund requested:* remaining (future) months are **refunded**; for the current month, attended (chargeable) sessions are charged and unattended sessions are not. *Pause without refund:* no money moves; the current month's attended sessions are charged and the remaining current-month + upcoming sessions are not — for an upfront-paid contract, the unused prepaid portion is **held as credit** until resume.
 - **"Attended"** means sessions that are **chargeable** under the no-show rules above (delivered sessions + student no-shows; teacher no-shows without a make-up are refunded, so excluded).
 - **Maximum pause duration is 6 months.** If a contract stays paused for 6 months with no resume, it is **auto-cancelled** with an email to both parties; any unused prepaid credit is **refunded minus the Stripe cut**.
@@ -86,7 +82,7 @@ A request/proposal is **not** a committed contract row — during negotiation it
 - **Teacher-initiated, mid-contract:** charged for **attended sessions only**; the remainder is refunded **in full** (no Stripe deduction) — **no penalty to the student**.
 - **Legitimate reason (admin-approved):** only the **Stripe cut** is deducted and the rest is **fully refunded**. The student contacts the **admin**, who makes the final decision.
 
-On cancellation the same terminal cleanup as completion applies (transcripts purged, student access revoked, teacher textbook retained).
+On cancellation the same terminal cleanup as completion applies (recordings purged, student access revoked, teacher textbook retained).
 
 ## 3. Architecture
 
@@ -94,7 +90,7 @@ The system is a **modular monolith** (Node.js + TypeScript) on a single VM behin
 
 ### 3.1 Components
 
-**1. Frontend — React + TypeScript SPA.** A single-page app built and served as static assets by Nginx, which also terminates TLS and reverse-proxies `/api` to the Node backend. All user interaction (discovery, contract negotiation, messaging, the in-app PDF viewer, the video/transcript screens, the teacher earnings view) lives here. It holds a Supabase-issued JWT and sends it on every API call.
+**1. Frontend — React + TypeScript SPA.** A single-page app built and served as static assets by Nginx, which also terminates TLS and reverse-proxies `/api` to the Node backend. All user interaction (discovery, contract negotiation, messaging, the in-app PDF viewer, the video/recording screens, the teacher earnings view) lives here. It holds a Supabase-issued JWT and sends it on every API call.
 
 **2. Auth module.** Delegates identity to **Supabase Auth** (email/password + Google OAuth). The backend verifies the Supabase JWT and maps it to a `users` row and a role: **admin** (internal dashboard), **student**, or **teacher**. Role is chosen at signup; admin is internal-only. Student-profile rows are protected by Supabase Row-Level Security.
 
@@ -106,14 +102,14 @@ The system is a **modular monolith** (Node.js + TypeScript) on a single VM behin
 
 **6. Materials — AWS S3 + CloudFront.** Binary files — profile photos, 1–2 min intro videos, and textbooks/PDFs — live in a single **S3 Standard** bucket; Postgres holds only the object key, never the bytes. **CloudFront** fronts everything. Private assets (contract PDFs, student photos) are served via short-lived **CloudFront signed URLs** the API mints *after* an authz check; public assets (profile photo, intro video) via a public distribution. **All materials are view-only — no download** (signed URLs are delivered inline into an in-app viewer with download disabled). S3 lifecycle / IA tiering / multi-bucket splits are deferred ([Section 8](#8-future-considerations)).
 
-**7. Daily.co video SDK.** Live 1:1 sessions (video/audio + screen sharing), fixed 1 hour. **Daily's in-call text chat is disabled** (`enable_chat: false`) and **cloud recording is disabled** (`enable_recording: false`) on every room.
+**7. Daily.co video SDK.** Live 1:1 sessions (video/audio + screen sharing), fixed 1 hour. **Daily's in-call text chat is disabled** (`enable_chat: false`) on every room; **cloud recording is set conditionally** from `contracts.recording_enabled` (`enable_recording` true only when the contract has opted in).
 
-**8. Daily.co AI transcript.** Transcription is **opt-in per contract** (default off). When the contract's `transcription_enabled` toggle is on, the room is created with `enable_transcription: true`; on session end Daily fires a transcript-ready webhook and the backend persists the speaker-labelled text in a `session_transcripts` row keyed by the session id. Transcripts stay **within the platform** (Postgres, RLS-gated to the participants), are viewable by the student for as long as the contract is up, and are purged on contract `completed`/`cancelled`. When off, no transcript is produced and no transcription cost is incurred.
+**8. Daily.co cloud recording.** Recording is **opt-in per contract** (default off). When the contract's `recording_enabled` toggle is on, the room is created with `enable_recording: true`; on session end Daily fires a recording-ready webhook and the backend stores the recording file in **S3** and writes a `session_recordings` metadata row keyed by the session id. Recordings stay **within the platform** (S3 media + RLS-gated metadata in Postgres), are playable **view-only via signed URL** for as long as the contract is up, and are purged on contract `completed`/`cancelled`. When off, nothing is recorded and no recording cost is incurred.
 
 **Supporting services.**
 
 - **Resend (email, external).** Sends the three transactional emails — contract established, teacher payout sent, student-approaches-teacher — triggered by the Contract and Payment modules. Supabase Auth also ships its auth mails (verification / reset / magic link) via Resend SMTP, so all email shares one domain and one set of DKIM/SPF/DMARC records and logs.
-- **In-process scheduler (internal).** A single-instance scheduler (no distributed locking needed) runs the time-based jobs: triggering due Stripe charges on contract anniversaries for sliced contracts, the **monthly payout batch on the 28th**, incrementing `delivered_hours_total` when a session transitions to `delivered`, and the transcript purge when a contract reaches a terminal state.
+- **In-process scheduler (internal).** A single-instance scheduler (no distributed locking needed) runs the time-based jobs: triggering due Stripe charges on contract anniversaries for sliced contracts, the **monthly payout batch on the 28th**, incrementing `delivered_hours_total` when a session transitions to `delivered`, and the recording purge when a contract reaches a terminal state.
 
 ### 3.2 System overview
 
@@ -138,7 +134,7 @@ graph TD
         ObjStore[(AWS S3 + CloudFront)]
         Stripe[Stripe<br/>Billing + Connect]
         Video[Daily.co<br/>video SDK]
-        Transcript[Daily.co<br/>AI transcript]
+        Recording[Daily.co<br/>cloud recording]
         Email[Resend<br/>email]
     end
 
@@ -146,7 +142,7 @@ graph TD
     Nginx -->|/api| Auth & Contracts & Payments & Messaging & Media
     Browser -->|join room| Video
     Stripe -->|webhooks| Nginx
-    Transcript -->|transcript-ready webhook| Nginx
+    Recording -->|recording-ready webhook| Nginx
 
     Auth -->|verify JWT / OAuth| Supabase
     Contracts -->|SQL txns| Supabase
@@ -155,8 +151,9 @@ graph TD
     Messaging -->|messages + corpus| Supabase
     Media -->|signed URLs · bytes| ObjStore
     Media -->|create rooms| Video
-    Video -.->|opt-in| Transcript
-    Media -->|transcript text| Supabase
+    Video -.->|opt-in| Recording
+    Media -->|recording file| ObjStore
+    Media -->|recording metadata| Supabase
 
     Scheduler -->|anniversary charges · 28th payouts| Stripe
     Scheduler -->|state · counters · purge| Supabase
@@ -177,29 +174,7 @@ Bytes in S3, only the key in Postgres. **All media sits in one S3 Standard bucke
 | Intro video (1–2 min) | Standard | Public dist. | Public on profile · view-only |
 | Books / PDFs | Standard | Signed URLs | Private; contract-gated · view-only, no download |
 
-Private buckets are reachable only through CloudFront via **Origin Access Control**; the API mints a short-lived **CloudFront signed URL** after the authz check (no public object URLs ever leave the server), delivered inline to an in-app viewer that disables download. Transcripts are not in S3 — they live in Postgres as text and are protected by RLS on the `session_transcripts` table.
-
-### 3.4 Critical flow — contract approval, first charge, activation
-
-```mermaid
-sequenceDiagram
-    participant S as Student (SPA)
-    participant App as Node app (Contract/Payment)
-    participant DB as Supabase Postgres
-    participant Stripe as Stripe
-
-    S->>App: POST /contracts/{id}/approve (payment_option)
-    App->>DB: txn — status = pending_payment, payment(pending)
-    App->>Stripe: charge (full amount, or first slice)
-    Stripe-->>App: PaymentIntent processing
-    App-->>S: 202 Accepted — awaiting payment
-
-    Stripe-->>App: webhook payment_intent.succeeded
-    App->>DB: txn — payment cleared, status = active, set anniversaries (if sliced)
-    App-->>S: contract active
-
-    Note over App,Stripe: payment_intent.payment_failed → stays inactive, re-prompt student
-```
+Private buckets are reachable only through CloudFront via **Origin Access Control**; the API mints a short-lived **CloudFront signed URL** after the authz check (no public object URLs ever leave the server), delivered inline to an in-app viewer/player that disables download. Recordings live in S3 as media (played back view-only via the same signed-URL path); their metadata rows are protected by RLS on the `session_recordings` table.
 
 ### 3.5 Deployment & recovery
 
@@ -239,7 +214,7 @@ erDiagram
     TEACHER_PROFILES ||--o{ CONTRACTS : "teacher in"
     CONTRACTS ||--o{ CONTRACT_PLAN_REVISIONS : negotiates
     CONTRACTS ||--o{ SESSIONS : schedules
-    SESSIONS ||--o| SESSION_TRANSCRIPTS : produces
+    SESSIONS ||--o| SESSION_RECORDINGS : produces
     CONTRACTS ||--o{ PAYMENTS : bills
     CONTRACTS ||--o{ MESSAGES : contains
     PAYOUT_BATCHES ||--o{ SESSIONS : pays
@@ -303,11 +278,11 @@ Key tables (selected columns).
 | `sessions_per_week` | int | each session fixed 1 h; ≥4 sessions total |
 | `total_price_cents` | int | USD |
 | `payment_option` | enum | `upfront` \| `installments` (installments = monthly anniversary slices; 1-month contracts are `upfront` only) |
-| `status` | enum | `requested\|proposed\|pending_payment\|active\|paused\|cancelled\|completed` |
+| `status` | enum | `requested\|proposed\|pending_payment\|active\|paused\|cancelled\|completed`. `requested`/`proposed` are pre-acceptance inbox states; a committed row begins at `pending_payment` (see [Section 2.3](#23-contract-lifecycle)) |
 | `start_at` | timestamptz | |
 | `contract_anniversary_dom` | int | clamps to last day of shorter months |
 | `paused_at?` | timestamptz | |
-| `transcription_enabled` | bool, default false | toggles Daily transcription; state at session start applies |
+| `recording_enabled` | bool, default false | toggles Daily cloud recording; state at session start applies |
 
 Index: `(status)`, `(teacher_id)`, `(student_id)`.
 
@@ -360,12 +335,15 @@ Index: `(status)`, `(teacher_id)`, `(student_id)`.
 | `delivered_at?` | timestamptz | drives hours tracking |
 | `payout_batch_id?` | uuid FK | |
 
-**`session_transcripts`** — RLS-gated to participants; purged on contract terminal state
+**`session_recordings`** — RLS-gated to participants; media in S3, purged on contract terminal state
 
 | Column | Type | Notes |
 |---|---|---|
 | `session_id` | uuid PK/FK → sessions | |
-| `transcript` | jsonb | Deepgram payload — speaker turns + timestamps |
+| `s3_key` | text | object key for the recording media (bytes never in Postgres) |
+| `duration_sec` | int | recorded length |
+| `size_bytes` | bigint | media size; drives storage/egress |
+| `status` | enum | `processing\|ready\|failed` |
 | `created_at` | timestamptz | |
 
 **`messages`** — all rows retained as ML corpus
@@ -388,45 +366,46 @@ No sharding/partitioning — a single small Postgres instance is far within capa
 - **Media bytes in S3, key in Postgres → vs storing photos as Postgres BLOBs.** *Why:* even at ≤5 MB/photo, BLOBs bloat every backup and daily snapshot, tie up a scarce single-instance connection for the whole transfer (competing with contract/payment queries), and can't sit behind a CDN. Keys-in-DB keeps the same code path as PDFs. *Gave up:* a second system (S3) in the data path — acceptable, it's already required for PDFs and intro videos.
 - **All media in one S3 Standard bucket → vs IA / lifecycle tiering from day one.** *Why:* at this volume the storage bill is a rounding error, and IA's per-GB retrieval fee penalizes frequently-viewed objects (profile photos) — tiering optimizes a cost that isn't material yet while adding operational rules. One Standard bucket is the simplest correct default. *Gave up:* marginal per-GB savings on cold objects (old intro videos, ended-contract PDFs) — deferred to [Section 8](#8-future-considerations) once volume justifies it.
 - **Stripe Billing + Connect → vs a custom billing/payout engine.** *Why:* per-contract charges (full upfront or monthly anniversary slices), monthly payouts on the 28th, instant on-demand payouts, and marketplace split payouts (a flat 25 % at launch; Stripe's split-payout model would also accommodate a future per-teacher rate, kept open in [Section 8](#8-future-considerations)) are exactly Stripe's domain; keeps PCI scope out. *Gave up:* fee per transaction (and the Stripe instant-payout fee passed to teachers who draw early) and Stripe-shaped data modeling; acceptable versus building a correct money system from scratch.
-- **Daily.co (video + opt-in AI transcription, no recording) → vs self-hosted SFU (or Agora).** *Why:* 1:1 video + screen share + built-in Deepgram-backed transcription with a transcript-ready webhook is commodity; self-hosting WebRTC and a transcription pipeline is disproportionate at ~200 h/mo, and Daily's room flags let us cleanly disable both native chat *and* video recording to keep moderation guarantees and avoid storing minors' video. *Gave up:* per-minute cost on video + transcription (transcription is **opt-in per contract** — see [Section 2.1](#21-functional-requirements) — so the transcription line in [Section 7](#7-pricing) is a *cap*, not a fixed cost, and scales with adoption), and a soft provider lock-in — bounded because the only artifact we keep is the transcript text, stored in our own Postgres. A future move to self-hosted transcription + summarization is in [Section 8](#8-future-considerations).
+- **Daily.co (video + opt-in cloud recording) → vs self-hosted SFU (or Agora).** *Why:* 1:1 video + screen share + cloud recording with a recording-ready webhook is commodity; self-hosting WebRTC and a recording pipeline is disproportionate at ~200 h/mo, and Daily's room flag still lets us cleanly disable native chat to keep moderation guarantees. Recording reverses the earlier no-recording stance: the privacy controls are now **per-contract opt-in (consent), view-only playback, and purge at contract end** rather than not capturing at all. *Gave up:* per-minute cost on video + recording (recording is **opt-in per contract** — see [Section 2.1](#21-functional-requirements) — so the recording line in [Section 7](#7-pricing) is a *cap*, not a fixed cost, and scales with adoption), added S3 storage + playback egress, and a soft provider lock-in — bounded because recordings land in our own S3. A future move to self-hosted video (LiveKit, recording to the same S3) is in [Section 8](#8-future-considerations).
 - **Regex/heuristic PII filter now → vs a managed moderation API (Hive) or self-hosted ML (Presidio / OSS NER).** *Why:* at validation scale the goal is enough friction that going off-platform costs more than staying on it, not a perfect PII firewall — regex delivers that at zero cost/latency and keeps message content on the VM (a paid API would also be a recurring per-message cost and would send every message to a third party, against the privacy posture). A flagged message is simply withheld (warning placeholder) with no account penalties; every message is retained as a free labelled corpus. *Gave up:* recall on obfuscated/novel attempts — accepted, with a documented upgrade path ([Section 8](#8-future-considerations)) to a traditional classifier (Hive/Presidio remain fallbacks if accuracy proves insufficient). *Explicitly not an LLM/SLM:* short-text contact-info detection is textbook linear/NER classification; an LLM is unjustified cost and latency here.
 - **No queue/cache → vs Redis + a job queue.** *Why:* request volume and the scheduler's daily/monthly cadence fit a single in-process scheduler against Postgres; one instance means no distributed-lock complexity. *Gave up:* horizontal worker scaling and sub-second fan-out — neither is needed yet; revisit if the user base grows an order of magnitude.
 
-**Cost:** see **[Section 7](#7-pricing) Pricing** for the itemized monthly run-rate (~\$179–\$250/month at this scale depending on transcription opt-in, excluding Stripe pass-through).
+**Cost:** see **[Section 7](#7-pricing) Pricing** for the itemized monthly run-rate (~\$179–\$365/month at this scale depending on recording opt-in, excluding Stripe pass-through).
 
 ## 7. Pricing
 
-Itemized monthly cost at the stated validation scale. **Assumptions:** 200 one-on-one video-hours/month. Daily bills **video per participant-hour** — 200 hours × 2 participants (1 teacher + 1 student) = **400 participant-hours = 24,000 user-minutes**. Daily bills **transcription per audio-hour** = **200 hours = 12,000 audio-minutes**, but transcription is **opt-in per contract** (default off), so that figure is a *ceiling* and the realistic launch figure is lower until adoption ramps.
+Itemized monthly cost at the stated validation scale. **Assumptions:** 200 one-on-one video-hours/month. Daily bills **video per participant-hour** — 200 hours × 2 participants (1 teacher + 1 student) = **400 participant-hours = 24,000 user-minutes**. Daily bills **cloud recording per recording-minute** (one composite stream per session) = **200 hours = 12,000 recording-minutes**, but recording is **opt-in per contract** (default off), so that figure is a *ceiling* and the realistic launch figure is lower until adoption ramps.
 
 | Component | Unit price | Monthly basis | Monthly cost |
 |---|---|---|---|
 | Daily.co — video | \$0.0040 / user-min | 24,000 user-min (400 participant-hrs) | **\$96.00** |
-| Daily.co — AI transcription | \$0.0059 / audio-min | ≤12,000 audio-min (opt-in; bills only on enabled sessions) | **≤\$70.80** |
+| Daily.co — cloud recording | \$0.0150 / recording-min ⁴ | ≤12,000 recording-min (opt-in; bills only on enabled sessions) | **≤\$180.00** |
 | Supabase — database | \$25 + \$10 compute | flat | **\$35.00** |
-| AWS CloudFront | ~\$0.085 / GB egress + request fees (pay-as-you-go, no flat fee) | ~60 GB/mo³ | **~\$6.00** |
-| AWS S3 (Standard) | \$0.023 / GB-mo | ~60 GB resident¹ | **~\$2.00** |
+| AWS CloudFront | ~\$0.085 / GB egress + request fees (pay-as-you-go, no flat fee) | ~120 GB/mo³ (incl. recording playback) | **~\$10.00** |
+| AWS S3 (Standard) | \$0.023 / GB-mo | ~150 GB resident¹ (incl. recordings) | **~\$3.50** |
 | Single VM | ~\$10–40 | flat (provider TBD) | **~\$20.00** |
 | Resend — transactional email | \$20 / mo (paid plan, 50k emails) | flat | **\$20.00** |
-| **Platform run-rate** | | | **≈ \$179 / month** (no transcription opt-in) **to ≈ \$250 / month** (full opt-in) |
+| **Platform run-rate** | | | **≈ \$179 / month** (no recording opt-in) **to ≈ \$365 / month** (full opt-in) |
 | PII filtering | in-process regex | — | **\$0** |
 | Stripe | 3.7% + \$0.30 / charge | per transaction | *pass-through²* |
 
-¹ No video recording is stored, so S3 holds only profile photos, intro videos (1–2 min each), and uploaded PDFs — all on Standard, ~60 GB total at 300 users; storage cost is a rounding error.
+¹ S3 holds profile photos, intro videos (1–2 min each), uploaded PDFs, and — when contracts opt in — session recordings (video ≫ text). The ~150 GB figure assumes moderate recording adoption; it is **bounded by purge-on-terminal** (recordings drop out at contract `completed`/`cancelled`) and stays near the ~60 GB media-only baseline until adoption ramps.
 
-² Stripe fees are a variable pass-through on student charges, not a platform run cost — excluded from the run-rate total. The **same 3.7 % + \$0.30** also applies as an instant-payout fee deducted from any teacher who draws earnings before the 28th. PII filtering adds \$0 (in-process regex; no third-party provider). Daily's transcription (\$0.0059/audio-min, Deepgram-backed) is billed only for sessions whose contract has `transcription_enabled = true`; the \$70.80 line is a ceiling, not a fixed monthly charge.
+² Stripe fees are a variable pass-through on student charges, not a platform run cost — excluded from the run-rate total. The **same 3.7 % + \$0.30** also applies as an instant-payout fee deducted from any teacher who draws earnings before the 28th. PII filtering adds \$0 (in-process regex; no third-party provider). Daily's cloud recording is billed only for sessions whose contract has `recording_enabled = true`; the \$180 line is a ceiling, not a fixed monthly charge.
 
-³ CloudFront is **pay-as-you-go** (per-GB egress + per-10k requests, no fixed/committed fee); ~60 GB/mo covers profile-photo views, intro-video previews on the discovery page, and PDF reads. No recording-playback egress.
+³ CloudFront is **pay-as-you-go** (per-GB egress + per-10k requests, no fixed/committed fee); the ~120 GB/mo covers profile-photo views, intro-video previews on the discovery page, PDF reads, and **recording playback** for opted-in contracts. Playback egress scales with recording adoption and views; at launch (recording off) it stays near the ~60 GB media-only baseline.
 
-**Shape of the bill:** Daily.co — video (\$96, ~54 % of the launch-floor total) is the dominant variable line and scales with delivered participant-minutes. Daily.co — transcription (≤\$70.80) is *conditionally* variable and becomes the second-largest line when fully adopted: it bills only for opted-in sessions, so at launch (default off) it starts near \$0 and grows toward its cap as adoption ramps. Everything else is fixed (Supabase + VM + Resend = **\$75**) or rounding-error (S3 + CloudFront ≈ \$8). The two Daily lines together drive almost all cost growth; the fixed tier holds and S3/CloudFront stay negligible.
+⁴ **Confirm against Daily's current price list.** \$0.0150/recording-min is a representative cloud-recording rate used to size the line; substitute the live rate before relying on the figure.
+
+**Shape of the bill:** Daily.co — video (\$96, ~54 % of the launch-floor total) is the dominant variable line and scales with delivered participant-minutes. Daily.co — cloud recording (≤\$180) is *conditionally* variable and becomes the **largest line when fully adopted**: it bills only for opted-in sessions, so at launch (default off) it starts near \$0 and grows toward its cap as adoption ramps — pulling its S3 storage and CloudFront playback egress up with it. Everything else is fixed (Supabase + VM + Resend = **\$75**). At launch (recording off) the bill sits at the ~\$179 floor; recording is the single driver pushing it toward the ~\$365 ceiling.
 
 ## 8. Future Considerations
 
 Deliberately **not built now** — recorded here so the current design stays minimal but the path is known:
 
 - **Traditional ML PII classifier (regex → learned model).** The regex filter runs in production as a weak-supervision *labelling function*: every decision is logged so a small classifier (logistic regression / linear SVM / small NER on char+word n-grams — **not** an LLM/SLM) can later be trained to beat regex on obfuscated/novel attempts. **Data to collect now so the dataset exists when it's needed:** (1) every flagged message with `matched_rules[]`; (2) `admin_label` whenever an admin reviews a flag (true/false-positive ground truth); (3) a **small random sample of *un*flagged delivered messages** for periodic human spot-labelling — without this the model only relearns the regex and can never measure or close false-negatives; (4) post-hoc signals already available — messages shortly followed by an off-platform-contact report or contract dispute — as additional positives. Train only once volume justifies it; deploy the model as a same-VM CPU sidecar (no GPU/hosted inference at this scale). Hive / self-hosted Presidio remain documented fallbacks if regex accuracy proves insufficient before then.
-- **Local payment methods.** USD-only card billing will see a steady tail of cross-border declines (foreign-issuer banks blocking USD). Once decline-rate data justifies the integration cost, add region-appropriate local methods (e.g. bKash / JazzCash / UPI / SEPA) — much higher acceptance and lower fees in those corridors, at the cost of additional provider integrations and settlement complexity.
-- **Seniority commission tier (25 % → 15 % after 500 delivered hours).** The `delivered_hours_total` counter on `teacher_profiles` already increments at launch (see [Section 5](#5-data-model)), and `payout_batches.commission_bps` is already the per-batch rate column — only the payout-time rate selection (`commission_bps = 1500 if delivered_hours_total ≥ 500 else 2500`, read at batch open time) needs turning on. *Decision criteria:* at least one teacher within a quarter of crossing the threshold, and unit economics confirmed to support 15 % at that teacher's hourly rate — below roughly \$8/hr the 15 % tier is structurally unprofitable once Daily video + Stripe + transcription costs are netted out.
-- **Self-hosted AI transcription + summarization.** Once meaningful opt-in adoption pushes the Daily transcription line toward its ceiling, replace it with faster-whisper (CPU on the same VM at low volume; small GPU once justified) plus an in-house LLM call for **post-session summarization and study-note generation** — capabilities Daily's built-in transcription does *not* provide. *Decision criteria:* monthly Daily transcription bill exceeds the amortized cost of running the self-hosted stack, OR product needs summaries / study-notes / searchable corpus that Deepgram-via-Daily cannot supply. Transcripts continue to land in the same `session_transcripts` table — only the producer changes; the room-level `enable_transcription` flag flips to disabled and audio is pulled via Daily's recording-less media stream into the self-hosted pipeline.
+- **Seniority commission tier (25 % → 15 % after 500 delivered hours).** The `delivered_hours_total` counter on `teacher_profiles` already increments at launch (see [Section 5](#5-data-model)), and `payout_batches.commission_bps` is already the per-batch rate column — only the payout-time rate selection (`commission_bps = 1500 if delivered_hours_total ≥ 500 else 2500`, read at batch open time) needs turning on. *Decision criteria:* at least one teacher within a quarter of crossing the threshold, and unit economics confirmed to support 15 % at that teacher's hourly rate — below roughly \$8/hr the 15 % tier is structurally unprofitable once Daily video + Stripe + recording costs are netted out.
+- **Self-hosted video SDK (LiveKit).** Daily.co is the launch video provider for speed and zero ops. Once the user base is large enough that Daily's per-minute pricing exceeds the cost of running infrastructure, replace it with **self-hosted LiveKit** (open-source WebRTC SFU) on the same/adjacent VM. *Decision criteria:* monthly Daily video bill exceeds the amortized cost of LiveKit hosting (VM/bandwidth + TURN + ops overhead). The session-join layer is abstracted behind our own room API so the swap is provider-internal; opt-in recordings continue to land in the same S3 bucket and `session_recordings` table (LiveKit's egress records straight to S3) — only the producer changes.
 - **Teacher vetting / verification.** The full automated vetting pipeline — document intake, a composite scoring algorithm, an admin review queue for ambiguous cases, and the `verified` trust tick on profiles — is deferred entirely. At launch teachers are simply listed (no badge). The intended pipeline boundary and status machine (`processing → auto_verified | auto_listed | admin_queue | rejected`) are recorded so verification can be added later as an additive layer on the existing teacher-profile model, without reworking it.
 - **S3 storage tiering & lifecycle.** At launch all media sits in one S3 Standard bucket. Later, once volume justifies the retrieval-fee tradeoffs: move cold objects (old intro videos, ended-contract PDFs) to Standard-IA / Glacier via lifecycle rules, and/or split public vs private buckets.
 - **Scale-out triggers.** If users grow ~10×, revisit: a managed VM with autoscaling or container platform, a Redis-backed job queue for the scheduler, and read replicas — none justified at 300 users.
@@ -442,10 +421,10 @@ A surface-area inventory used as a checkpoint before implementation begins. Each
 | 1 | Auth & accounts (student / teacher / admin roles) | ✅ ready | Supabase Auth + Google OAuth; role chosen at signup; admin internal. |
 | 2 | Teacher discovery & search (browse, filter, profile view) | ✅ ready | Parameterized SQL; filter set fixed in [Section 2.1](#21-functional-requirements). |
 | 3 | Teacher onboarding & vetting (application, admin review) | ⏸ deferred | Entire vetting pipeline + scoring + verified tick deferred to [Section 8](#8-future-considerations); teachers are simply listed at launch. |
-| 4 | Contract lifecycle (proposal → approval → active → paused/completed/cancelled) | 🟡 needs clarity | State machine designed (fixed 1 h sessions, ≥4 sessions/≥1 month); **teacher-initiated cancellation** path is a gap. |
+| 4 | Contract lifecycle (proposal → approval → active → paused/completed/cancelled) | ✅ ready | Full state machine, no-show, pause, and cancellation (incl. teacher-initiated) specified in [Section 2.3](#23-contract-lifecycle). |
 | 5 | Scheduling & calendar (session slots, reminders) | ✅ ready | Fixed 1 h sessions; UTC + viewer-local display; 24 h reschedule rule. |
-| 6 | Video conferencing (Daily.co) | ✅ ready | 1:1, fixed 1 h; native chat + recording disabled. |
-| 7 | Session transcripts (Daily AI transcription) | ✅ ready | **Opt-in per contract** (default off); kept in-platform (Postgres), viewable by the student while the contract is up, purged on terminal state. Toggle = `contracts.transcription_enabled`. |
+| 6 | Video conferencing (Daily.co) | ✅ ready | 1:1, fixed 1 h; native chat disabled; recording set conditionally per contract. |
+| 7 | Session recordings (Daily cloud recording) | ✅ ready | **Opt-in per contract** (default off); media in S3, view-only via signed URL, viewable while the contract is up, purged on terminal state. Toggle = `contracts.recording_enabled`. |
 | 8 | In-platform messaging (with PII moderation) | ✅ ready | Regex on every message; flagged → warning placeholder, no bans; **all messages stored** for [Section 8](#8-future-considerations) ML. |
 | 9 | Materials sharing (photos/PDFs in S3) | ✅ ready | Single Standard bucket; contract-gated signed URLs; **view-only, no download**. |
 | 10 | Reviews / ratings (post-contract) | 🟡 needs clarity | Referenced on profiles ([Section 2.1](#21-functional-requirements)) but **submission flow, schema, moderation, and edit/delete policy are not yet designed.** |
@@ -461,19 +440,13 @@ A surface-area inventory used as a checkpoint before implementation begins. Each
 |---|---|---|---|
 | 1 | Identity / Auth (Supabase) | ✅ ready | JWT verify → `users` row + role; RLS for student profiles. |
 | 2 | Profiles & Discovery | ✅ ready | SQL + GIN indexes on `subjects`, `languages`. |
-| 3 | Contracts | 🟡 needs clarity | State machine clear; **teacher-initiated cancellation transitions** missing. |
+| 3 | Contracts | ✅ ready | State machine and all transitions (incl. teacher-initiated cancellation) specified in [Section 2.3](#23-contract-lifecycle). |
 | 4 | Scheduling | ✅ ready | UTC storage + viewer-local display; reschedule rules in [Section 2.1](#21-functional-requirements). |
 | 5 | Messaging (incl. regex PII filter) | ✅ ready | Filter rules + corpus schema set; flagged → warning placeholder, no bans; classifier deferred to [Section 8](#8-future-considerations). |
 | 6 | Media (S3 + CloudFront, signed URLs) | ✅ ready | Single Standard bucket; OAC + inline signed URLs; **view-only, no download**; tiering deferred ([Section 8](#8-future-considerations)). |
-| 7 | Video integration (Daily.co webhooks) | ✅ ready | Room flags (`enable_chat: false`, `enable_recording: false`, `enable_transcription` set conditionally from `contracts.transcription_enabled`) + transcript-ready webhook handler (only fires when transcription is on). |
+| 7 | Video integration (Daily.co webhooks) | ✅ ready | Room flags (`enable_chat: false`; `enable_recording` set conditionally from `contracts.recording_enabled`) + recording-ready webhook handler (only fires when recording is on; persists media to S3 + metadata row). |
 | 8 | Billing (Stripe — per-contract charges, webhooks) | ✅ ready | Two options decided (full upfront / monthly anniversary slices); idempotent against Stripe event IDs; lifecycle billing in [Section 2.3](#23-contract-lifecycle). Mid-term slice **decline** handling still open ([Section 8](#8-future-considerations)). |
 | 9 | Payouts (Stripe Connect — Transfers, KYC) | 🟡 needs clarity | Monthly on the 28th, flat 25 %, instant payout (Stripe fee), earnings API. `delivered_hours_total` increments (future tier — [Section 8](#8-future-considerations)). Edge cases: KYC, dispute holdback, tax forms, FX. |
 | 10 | Notifications | ✅ ready | Resend API (three triggers) + Supabase Auth via Resend SMTP; React Email templates colocated with module. |
-| 11 | Scheduler / Worker (cron: anniversary charges, 28th payouts, transcript purges, delivered-hours counter) | ✅ ready | In-process; jobs enumerated in [Section 3](#3-architecture). |
+| 11 | Scheduler / Worker (cron: anniversary charges, 28th payouts, recording purges, delivered-hours counter) | ✅ ready | In-process; jobs enumerated in [Section 3](#3-architecture). |
 | 12 | Admin module | 🟡 needs clarity | Backend endpoints implied but **API surface + UI not specified** (see row 15 above). |
-
-**Summary of what still needs design work before implementation can finish:** reviews/ratings (10), payout edge cases (12 & 9), and the admin console surface (15 & 12). Refunds/disputes and teacher vetting are deferred by design ([Section 8](#8-future-considerations)). Everything else is implementation-ready.
-
----
-
-*Open items deferred by design: teacher vetting/verification, refund + dispute policy, S3 storage tiering, and VM provider (all [Section 8](#8-future-considerations)). Now decided in this design: PII moderation (regex-first, ML-later; flagged → warning placeholder, no bans, all messages stored — [Section 3](#3-architecture) / [Section 6](#6-trade-offs--alternatives) / [Section 8](#8-future-considerations)), no platform subscription fee — revenue is commission-only ([Section 2.1](#21-functional-requirements)), billing currency (USD), **flat 25 % commission** (seniority tier deferred to [Section 8](#8-future-considerations)), **monthly teacher payouts on the 28th with optional instant payout (Stripe 3.7 % + \$0.30)**, **two contract payment options — full upfront or monthly anniversary slices**, **fixed 1-hour sessions**, **materials view-only / no download on a single S3 Standard bucket**, **no cap on concurrent active contracts per student**, session transcripts **opt-in per contract** via Daily AI transcription — kept in-platform, no cloud recording ([Section 2.1](#21-functional-requirements)).*
