@@ -23,7 +23,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['jest.config.js'],
+    files: ['jest.config.js', 'eslint.config.mjs'],
     rules: { 'no-restricted-syntax': 'off' },
   },
 );
