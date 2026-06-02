@@ -36,6 +36,10 @@ Off-platform contact stays disallowed for the lifetime of the relationship. The 
 
 - **Recordings.** Recording is **opt-in per contract**, **default off**. Either participant can toggle `recording_enabled` from the contract view between sessions; the state at session start time is the state used for that session. When **on**, the session is recorded by **Daily.co's cloud recording** (`enable_recording: true` on the room); on session end the recording-ready webhook lands the file in **our S3** and writes a metadata row, and the recording is offered **view-only via a CloudFront signed URL** (no download). When **off**, recording is disabled at the room level — nothing is captured and no recording cost is incurred. For sessions that *were* recorded: recordings are available to students **for the lifetime of the contract**, locked (not deleted) while a contract is `paused`, and purged on `completed`/`cancelled`. The setting is visible on the contract page and in the pre-session lobby so both parties always know whether the upcoming session will be recorded.
 
+- **Broadcast requests.** A student may broadcast a learning request for a specific subject. The request fans out to all teachers who teach that subject, excluding any teacher the student already has an `ACTIVE` contract with. **A student may not broadcast for a subject if they have an `ACTIVE` contract for that subject with fewer than 4 delivered sessions** — both the UI option and the API block this. This ensures a minimum 4-session commitment before switching teachers for the same subject. The broadcast option becomes available once 4 sessions are delivered, or if the existing contract was cancelled due to an admin-approved legitimate reason on the teacher's side. Matched teachers receive a notification and can view the student's profile temporarily for the duration of the request. Teachers respond via the standard contract flow (`INITIATED → PROPOSED`). The student may interact with multiple teachers simultaneously and choose one to sign a contract with; once a contract goes `ACTIVE`, all other notifications and proposals for that broadcast are auto-cancelled. The student may cancel the broadcast early at any time. If no contract is signed within **7 days**, the request auto-expires — the student may re-submit. Multiple simultaneous broadcasts are allowed (different subjects).
+
+- **Ratings & recommendations.** After a contract reaches `COMPLETED`: the student may leave a **rating (1–5 stars) and written review** for the teacher — publicly visible on the teacher's profile. The teacher may write a **recommendation** for the student — private, visible only to other teachers when they have an active or in-negotiation contract with that student.
+
 - **Transactional email.** Three business triggers, all sent through **Resend** as the single provider: (1) **contract established** → email to the student with the contract details **and** the amount charged / to be charged; (2) **teacher payout sent** (via Stripe) → email to the teacher; (3) **a student approaches a teacher for a contract** → email to the teacher. Supabase Auth additionally delivers its own auth emails (verification, password reset, magic link) via Resend SMTP, so every outbound email shares one domain, one set of DKIM/SPF/DMARC records, and one set of delivery logs.
 
 ### 2.2 Non-Functional Requirements
@@ -62,16 +66,16 @@ The full lifecycle of a contract, from discovery to a terminal state. This secti
 ACCEPTED → ACTIVE → (PAUSED ⇄ ACTIVE) → COMPLETED | CANCELLED
 ```
 
-A request/proposal is **not** a committed contract row — during negotiation it lives in the teacher's inbox. The contract is persisted **only when the student accepts** (as `ACCEPTED`). If the student declines, nothing is saved.
+The contract row is written when the student sends the initial request (`INITIATED`) and advances through negotiation states. A `DECLINED` contract is terminal — no further action is possible; the student may open a new request.
 
 **Happy path:**
 
 1. **Browse.** The student finds a teacher.
-2. **Request.** The student sends a request, choosing a slot from the teacher's stated availability. *Edge case:* if no listed slot works, the student requests a custom time via the teacher's **Open Availability**.
-3. **Propose.** The teacher reviews the student profile and proposes a study plan — **1-hour sessions**, **minimum 4 sessions**. The teacher may **reject** with no justification required (optional to give one).
-4. **Student decision.** **Accept** → contract written as `ACCEPTED' in contract_status column and 'PENDING` in payments table. Student redirected to the payments page · **Request modification** → teacher modifies (loop) or declines · **Decline** → nothing persisted.
+2. **Request.** The student sends a request, choosing a slot from the teacher's stated availability → contract row written as `INITIATED`. *Edge case:* if no listed slot works, the student requests a custom time via the teacher's **Open Availability**.
+3. **Propose.** The teacher reviews the student profile and proposes a study plan — **1-hour sessions**, **minimum 4 sessions** → contract moves to `PROPOSED`. The teacher may **reject** (→ `DECLINED`) with no justification required (optional to give one).
+4. **Student decision.** **Accept** → contract moves to `ACCEPTED`; payments row written as `PENDING`. Student redirected to the payments page · **Request modification** → contract moves to `REVISION`; teacher modifies (loop) or declines · **Decline** → contract moves to `DECLINED`.
 5. **Pay.** One of two options: **full upfront** (single charge of `total_amount_cents`), or **slices** (`slice_amount_cents = total_amount_cents ÷ (total_sessions ÷ sessions_per_week ÷ 4)`; one charge per monthly anniversary, first slice now). A 4-session contract is upfront-only.
-6. **Activate.** On payment cleared → `ACTIVE` on contract status column and 'COMPELETED' in payments table. The status flips to `ACTIVE` **only after** payment succeeds (atomicity — the redirect latency is acceptable). If payment is not completed within **24 h**, contract auto-voids and is dropped; the student can start a new contract anytime.
+6. **Activate.** On payment cleared → contract moves to `ACTIVE`; payments row moves to `DONE`. The status flips to `ACTIVE` **only after** payment succeeds (atomicity — the redirect latency is acceptable). If payment is not completed within **24 h**, contract auto-voids and is dropped; the student can start a new contract anytime.
 7. **Schedule.** The student books **all sessions upfront**, and may later **reschedule in the UI** (the ≥24 h-notice rule applies). **Rescheduling never changes payment.**
 8. **Deliver.** Sessions run over the term; every delivered 1-hour session is tracked (hours tracking).
 9. **Completion (time-based).** Driven by the same tracked-time variable used for teacher hours. When the contract's full contracted time is consumed, **5 minutes after the last session ends** both parties get an **Extend / Complete** prompt that stays open for **5 minutes**. If **Extend** is not chosen within that window, the contract auto-sets to `COMPLETED`. **Extend** adds more sessions at the **same per-session rate**, paid immediately via the same payment option; an extension must itself be **4–100 sessions** (same contract limits apply). After completion, any further extension requires a **new contract**.
@@ -98,11 +102,15 @@ A request/proposal is **not** a committed contract row — during negotiation it
 
 **Cancellation (`CANCELLED`).** The reference point for the 24-hour window is **24 h before the contract's start time** (first session):
 
-- **Pre-start (>24 h before start):** **full refund minus the Stripe cut.**
-- **Student-initiated, mid-contract:** charged for **attended sessions only**; the remainder is refunded.
-- **Teacher-initiated, mid-contract:** charged for **attended sessions only**; the remainder is refunded.
+- **Pre-start (>24 h before start):** **full refund minus the Stripe cut.** No session commitment applies — no sessions have been delivered yet.
+- **Mid-contract — minimum commitment:** Neither party may cancel mid-contract without an admin-approved legitimate reason **until at least 4 sessions have been delivered.** The cancellation option is hidden in the UI and rejected by the API until this threshold is met.
+- **Student-initiated, mid-contract (≥4 delivered sessions, no legitimate reason):** charged for **attended sessions only**; the remainder is refunded.
+- **Teacher-initiated, mid-contract (≥4 delivered sessions, no legitimate reason):** charged for **attended sessions only**; the remainder is refunded.
+- **Either party, mid-contract, admin-approved legitimate reason:** cancellation allowed at any point regardless of sessions delivered; charged for **attended sessions only**, remainder refunded. If it is the **teacher** who cancels with a legitimate reason before 4 sessions, the student is free to broadcast or start a new contract for the same subject immediately.
 
 On cancellation the same terminal cleanup as completion applies (recordings purged, student access revoked, teacher textbook retained).
+
+**Broadcast-originated contracts.** If a contract originates from a broadcast request (`broadcast_request_id` set), on the contract moving to `ACTIVE`: the linked `learning_requests` row is set to `FULFILLED` and all other `learning_request_notifications` rows for that request are set to `CANCELLED` — no other teacher can respond to that broadcast.
 
 ## 3. Architecture
 
@@ -195,6 +203,25 @@ flowchart TD
     Deliver --> Teacher[Teacher receives message]
 ```
 
+#### Flow 5 — Broadcast Request & Teacher Response
+
+```mermaid
+flowchart TD
+    Student[Student] --> Post[POST /api/broadcast-requests\nsubject + optional note]
+    Post --> Insert[learning_requests row inserted\nstatus = OPEN\nexpires_at = now + 7 days]
+    Insert --> Query[Backend queries teacher_profiles\nWHERE subjects contains requested subject\nEXCLUDES teachers with ACTIVE contract with student]
+    Query --> FanOut[Fan-out: insert learning_request_notifications\none row per matched teacher]
+    FanOut --> Realtime[Supabase Realtime pushes to online teachers\nOffline teachers see it on next dashboard load]
+
+    Realtime --> Teacher[Teacher views broadcast\nStudent profile temporarily visible]
+    Teacher --> Respond[Teacher responds via contract flow\nINITIATED → PROPOSED with broadcast_request_id]
+    Respond --> Student2[Student reviews study plans\nfrom one or more teachers]
+
+    Student2 -->|accepts one| Contract[Contract → ACCEPTED → ACTIVE\nrequest → FULFILLED\nall other notifications → CANCELLED]
+    Student2 -->|cancels broadcast| Cancel[request → CANCELLED\nall notifications → CANCELLED\nall proposals marked invalid]
+    Student2 -->|no action in 7 days| Expire[Scheduler: request → EXPIRED\nall notifications → CANCELLED\nStudent may re-submit]
+```
+
 ### 3.3 Storage
 
 Bytes in S3, only the key in Postgres. **All media sits in one S3 Standard bucket** at launch (lifecycle/IA tiering deferred — [Section 8](#8-future-considerations)); CloudFront fronts everything (cache + lower latency for a timezone-spread user base). **Nothing is downloadable — all assets are view-only.**
@@ -277,8 +304,9 @@ Every message passes the two-layer PII filter (regex → AWS Comprehend) before 
 | `GET /api/contracts/{contract_id}/sessions` | — | `sessions[]` with status | 200 |
 | `PATCH /api/sessions/{session_id}/reschedule` | `new_slot` | `session_id`, `status=rescheduled` | 200 / 400 |
 | `PATCH /api/sessions/{session_id}/cancel` | `reason?` | `status=cancelled` | 200 / 400 |
+| `POST /api/sessions/{session_id}/join-session` | — (authz: participant in contract) | `room_url`, `meeting_token`, `recording_enabled` | 200 / 403 |
 
-Reschedule and cancel enforce the ≥24 h notice rule. Session status (`delivered`) is set internally by the scheduler on session end — not exposed as a public endpoint.
+`join-session` mints the Daily room URL + a short-lived meeting token so the participant can enter the live call; the room is created lazily with `enable_chat: false` and `enable_recording` set from `contracts.recording_enabled`. Reschedule and cancel enforce the ≥24 h notice rule. Session status (`delivered`) is set internally by the scheduler on session end — not exposed as a public endpoint.
 
 ### 4.8 Recordings
 
@@ -315,6 +343,39 @@ Access is gated by an authz check at request time — no separate purge endpoint
 | `POST /api/webhooks/daily` | Daily.co recording-ready event (signature-verified) | `received` | 200 |
 
 Both are internal — not called by the frontend. Stripe webhook drives payment/payout state idempotently against Stripe event IDs. Daily webhook fires only when `recording_enabled = true`; stores recording to S3 and writes a `session_recordings` metadata row.
+
+### 4.12 Broadcast Requests
+
+| Method & Path | Request (key fields) | Response (key fields) | Status |
+|---|---|---|---|
+| `POST /api/broadcast-requests` | `subject`, `note?` | `request_id`, `expires_at` | 201 / 400 |
+| `DELETE /api/broadcast-requests/{request_id}` | — | `status=CANCELLED` | 200 / 403 |
+| `GET /api/broadcast-requests/{request_id}` | — | request details, matched teacher count | 200 / 403 |
+
+Rules:
+- A student may have multiple open broadcasts simultaneously (different subjects allowed).
+- **Blocked if < 4 delivered sessions for same subject:** `POST /api/broadcast-requests` returns `400` if the student has an `ACTIVE` contract for the requested subject with fewer than 4 delivered sessions. Exception: allowed immediately if the prior contract for that subject was cancelled due to an admin-approved legitimate reason on the teacher's side.
+- Fan-out on insert: backend queries `teacher_profiles WHERE subjects @> [subject]`, excludes teachers with an `ACTIVE` contract with that student, inserts one `learning_request_notifications` row per matched teacher, Supabase Realtime delivers to online teachers instantly.
+- Teacher responds via the existing contract `INITIATED → PROPOSED` flow with `broadcast_request_id` attached.
+- Student profile temporarily readable by all teachers with a `PENDING` notification row for that request (RLS); reverts on terminal state.
+- On `DELETE`: request → `CANCELLED`; all related notifications → `CANCELLED`; any in-progress proposals from teachers marked invalid.
+- On contract → `ACTIVE`: request → `FULFILLED`; all other notifications for that request → `CANCELLED`.
+- Auto-expiry: daily scheduler sets requests to `EXPIRED` and notifications to `CANCELLED` where `expires_at < now()` and `status = 'OPEN'`. Student may re-submit.
+
+### 4.13 Ratings & Recommendations
+
+| Method & Path | Request (key fields) | Response (key fields) | Status |
+|---|---|---|---|
+| `POST /api/contracts/{contract_id}/review` | `rating` (1–5), `body?` (text) | review id | 201 / 400 / 403 / 409 |
+| `GET /api/teachers/{teacher_id}/reviews` | — | `[{rating, body, student_name, created_at}]` | 200 |
+| `POST /api/contracts/{contract_id}/recommendation` | `body` (text) | recommendation id | 201 / 400 / 403 / 409 |
+| `GET /api/students/{student_id}/recommendations` | — | `[{body, teacher_name, created_at}]` | 200 / 403 |
+
+Rules:
+- `POST review` — caller must be the student on the contract; contract must be `COMPLETED`; one per contract (409 if already exists).
+- `POST recommendation` — caller must be the teacher on the contract; contract must be `COMPLETED`; one per contract (409 if already exists).
+- `GET reviews` — public.
+- `GET recommendations` — restricted to teachers who have a contract with the student in `INITIATED | PROPOSED | REVISION | ACCEPTED | ACTIVE` state (enforced by RLS + API auth check).
 
 ## 5. Data Model
 
@@ -361,9 +422,10 @@ Key tables (selected columns).
 
 | Column | Type | Notes |
 |---|---|---|
-| `teacher_id` | uuid FK | |
-| `weekday` | int | 0–6 |
-| `start_utc` / `end_utc` | time | |
+| `teacher_id` | uuid FK, PK (composite) | part of PK |
+| `weekday` | int, PK (composite) | 0–6; part of PK |
+| `start_utc` | time, PK (composite) | part of PK |
+| `end_utc` | time | |
 | `teacher_tz` | text | IANA, for "(originally …)" display |
 | `open_availability` | bool | |
 
@@ -375,7 +437,7 @@ Key tables (selected columns).
 | `student_id` / `teacher_id` | uuid FK | indexed |
 | `subject` | text | |
 | `total_sessions` | int | 4–100; enforced at API layer on contract proposal |
-| `sessions_per_week` | int | each session fixed 1 h; ≥4 sessions total |
+| `sessions_per_week` | int | number of sessions per week |
 | `total_amount_cents` | int | USD; full contract value |
 | `payment_options` | enum | `FULL` \| `INSTALLMENTS` (`INSTALLMENTS` = monthly anniversary slices; 4-session contracts are `FULL` only) |
 | `status` | enum | `INITIATED\|PROPOSED\|REVISION\|ACCEPTED\|ACTIVE\|PAUSED\|DECLINED\|CANCELLED\|COMPLETED`. `INITIATED` = student sent request, awaiting teacher; `PROPOSED` = teacher created/updated study plan, awaiting student; `REVISION` = student requested a change, awaiting teacher; `ACCEPTED` = student accepted plan, payment pending; `ACTIVE` = payment cleared; `DECLINED` = rejected pre-acceptance (terminal); `CANCELLED` = terminated post-`ACTIVE` (terminal) |
@@ -383,6 +445,7 @@ Key tables (selected columns).
 | ~~`contract_anniversary_dom`~~ | — | dropped; scheduler derives DOM from `start_at` at runtime: `day = EXTRACT(DAY FROM start_at)`, clamped to last day of the target month if needed |
 | `paused_at?` | timestamptz | |
 | `recording_enabled` | bool, default false | toggles Daily cloud recording; state at session start applies |
+| `broadcast_request_id?` | uuid FK → learning_requests | null for contracts not originating from a broadcast |
 
 Index: `(status)`, `(teacher_id)`, `(student_id)`.
 
@@ -428,10 +491,13 @@ Index: `(status)`, `(teacher_id)`, `(student_id)`.
 |---|---|---|
 | `id` | uuid PK | |
 | `contract_id` | uuid FK | |
+| `teacher_id` | uuid FK → users | copied from the contract at insert; backs the overlap exclusion constraint below |
 | `scheduled_start_utc` / `scheduled_end_utc` | timestamptz | fixed 1 h apart |
 | `status` | enum | `SCHEDULED\|DELIVERED\|CANCELLED\|RESCHEDULED` |
 | `delivered_at?` | timestamptz | drives hours tracking |
 | `payout_batch_id?` | uuid FK | |
+
+Constraint: `EXCLUDE USING gist (teacher_id WITH =, tstzrange(scheduled_start_utc, scheduled_end_utc) WITH &&) WHERE (status = 'SCHEDULED')` — prevents two scheduled sessions for the same teacher from overlapping.
 
 **`session_recordings`** — RLS-gated to participants; media in S3, purged on contract terminal state
 
@@ -456,6 +522,55 @@ Index: `(status)`, `(teacher_id)`, `(student_id)`.
 | `comprehend_entities[]?` | text[] | entity types detected by AWS Comprehend (Layer 2; null when Layer 1 short-circuited) |
 | `filter_layer` | enum | `none` \| `regex` \| `comprehend` — which layer flagged the message |
 | `created_at` | timestamptz | |
+
+**`teacher_reviews`** — public; one per completed contract
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | |
+| `contract_id` | uuid FK, unique | one review per contract |
+| `student_id` | uuid FK | reviewer |
+| `teacher_id` | uuid FK | indexed for profile queries |
+| `rating` | int | 1–5 |
+| `body?` | text | optional written review |
+| `created_at` | timestamptz | |
+
+**`student_recommendations`** — private; one per completed contract
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | |
+| `contract_id` | uuid FK, unique | one recommendation per contract |
+| `teacher_id` | uuid FK | author |
+| `student_id` | uuid FK | indexed for profile queries |
+| `body` | text | |
+| `created_at` | timestamptz | |
+
+RLS on `student_recommendations`: readable only by teachers who have a contract with the student in `INITIATED | PROPOSED | REVISION | ACCEPTED | ACTIVE` state.
+
+**`learning_requests`** — student broadcast requests
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | |
+| `student_id` | uuid FK | indexed |
+| `subject` | text | |
+| `note?` | text | optional context from student |
+| `status` | enum | `OPEN \| FULFILLED \| CANCELLED \| EXPIRED` |
+| `expires_at` | timestamptz | 7 days from `created_at` |
+| `created_at` | timestamptz | |
+
+**`learning_request_notifications`** — fan-out records per matched teacher
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | |
+| `request_id` | uuid FK → learning_requests | indexed |
+| `teacher_id` | uuid FK | indexed |
+| `status` | enum | `PENDING \| CANCELLED` |
+| `created_at` | timestamptz | |
+
+RLS on `learning_request_notifications`: teachers see only their own rows. Student profile readable by teachers with a `PENDING` row for that request — reverts to default RLS on terminal request state.
 
 No sharding/partitioning — a single small Postgres instance is far within capacity at this scale.
 
@@ -508,12 +623,12 @@ Ordered by priority. Not built at launch — paths are recorded so the current d
 
 2. **Seniority commission tiers (30% → 27% → 24% → 21% → 18%).** `delivered_hours` already increments on `teacher_profiles` and `payout_batches.commission_bps` is the per-batch rate column — only the tier-selection logic at batch-open time needs wiring. *Trigger:* unit economics confirmed to support the lower rate at the teacher's hourly rate and delivery volume.
 
-3. **Automated teacher verification.** Teachers at launch are simply listed (no badge). The deferred pipeline: document intake (certifications, degree, Ijaza) → automated scoring → admin queue for edge cases → `verified` tick on the teacher's public profile. Adds trust signal for students without reworking the teacher-profile model. *Trigger:* teacher supply large enough that unverified listings create a trust problem.
+3. **S3 bucket tiering + lifecycle rules.** All media currently in one S3 Standard bucket. Once volume justifies it: move cold objects (ended-contract PDFs, old intro videos) to Standard-IA or Glacier via lifecycle rules; optionally split public vs private buckets. *Trigger:* S3 storage cost becomes material.
 
-4. **S3 bucket tiering + lifecycle rules.** All media currently in one S3 Standard bucket. Once volume justifies it: move cold objects (ended-contract PDFs, old intro videos) to Standard-IA or Glacier via lifecycle rules; optionally split public vs private buckets. *Trigger:* S3 storage cost becomes material.
+4. **ML recommendation system.** Surface the right teachers for each student based on subject, learning history, session outcomes, and ratings — replacing pure filter-based discovery. Requires sufficient interaction data to train on. *Trigger:* student churn attributable to poor discovery; dataset large enough to train a meaningful model.
 
-5. **ML recommendation system.** Surface the right teachers for each student based on subject, learning history, session outcomes, and ratings — replacing pure filter-based discovery. Requires sufficient interaction data to train on. *Trigger:* student churn attributable to poor discovery; dataset large enough to train a meaningful model.
+5. **AI-based slide / lesson material creation.** In-platform tooling for teachers to generate structured lesson slides or study materials using an LLM. Reduces teacher prep time and adds platform stickiness. *Trigger:* teacher retention data shows prep burden as a drop-off reason.
 
-6. **AI-based slide / lesson material creation.** In-platform tooling for teachers to generate structured lesson slides or study materials using an LLM. Reduces teacher prep time and adds platform stickiness. *Trigger:* teacher retention data shows prep burden as a drop-off reason.
+6. **Async fan-out for broadcast requests.** At PMV scale, fan-out (query matched teachers + bulk insert notifications) runs synchronously in the request handler — acceptable with a small teacher pool. At scale, move to a background job queue so the student gets an immediate response and fan-out happens async. *Trigger:* fan-out latency becomes noticeable or teacher pool grows large enough to risk timeouts.
 
 7. **Self-hosted ML/NLP PII moderation.** Replace or augment AWS Comprehend with a purpose-trained classifier (NER on char+word n-grams) fine-tuned on domain-specific patterns (Islamic names, schools, community venues). Every message + `matched_rules[]` + `comprehend_entities[]` + any admin labels are retained now as the training corpus. Deploy as a same-VM CPU sidecar; no message API change. *Trigger:* Comprehend false-positive rate on domain-specific content proves material, or Comprehend cost exceeds sidecar compute cost.
