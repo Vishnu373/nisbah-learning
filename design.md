@@ -408,6 +408,8 @@ Key tables (selected columns).
 | `languages[]` | text[] | GIN index |
 | `expected_reply_minutes` | int | |
 | `delivered_hours` | int, default 0 | used at launch; starts 0, incremented per delivered session — kept for the future seniority tier ([Section 8](#8-future-considerations)) |
+| `education?` | text | optional; institution attended (e.g. "Al-Azhar University") — shown as a tag in UI if present |
+| `location` | text | **required**; current city/country of residence (e.g. "London, UK") — used for regional server routing ([Section 8](#8-future-considerations)) |
 
 **`student_profiles`** — RLS-restricted (owner + teacher in an active contract)
 
