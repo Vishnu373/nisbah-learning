@@ -419,6 +419,8 @@ Key tables (selected columns).
 | `photo_key?` | text | S3 object key |
 | `name` | text | |
 | `prior_subjects[]?` | text[] | optional; values: Aqidah, Usul, Quran, Fiqh, Arabic, Hadith |
+| `education?` | text | optional; institution attended — shown in profile if present |
+| `location` | text | **required**; current city/country of residence — used for regional server routing ([Section 8](#8-future-considerations)) |
 
 **`availability`**
 

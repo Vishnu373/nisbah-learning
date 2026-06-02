@@ -107,7 +107,7 @@ Key variables:
 
 | Variable | Used by |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Backend + Frontend |
+| `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` | Backend + Frontend |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Backend |
 | `DAILY_API_KEY` | Backend |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | Backend |
