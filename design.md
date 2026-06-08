@@ -50,11 +50,11 @@ Off-platform contact stays disallowed for the lifetime of the relationship. The 
 
 - **Recordings retention.** Recording media held in S3 Standard with a metadata row in Postgres for the contract lifetime; both purged when the contract reaches `completed` or `cancelled`. Footprint is bounded by purge-on-terminal (no indefinite media accumulation).
 
-- **Availability.** Best-effort single-VM (~99% — SPOF accepted at this stage). RTO of minutes-to-hours via daily VM image rebuild; **RPO for business data is effectively zero** because all durable state lives in Supabase / S3 / Stripe, not on the VM.
+- **Availability.** Best-effort single-VM (~99% — SPOF accepted at this stage). RTO of minutes-to-hours via daily VM image rebuild. **RPO is bounded by the Postgres backup cadence**: the relational database is now self-hosted on the VM, so durable business data is protected by regular (e.g. nightly + WAL) backups shipped off-VM rather than living in a managed DB; media and payment records remain off-VM in S3 / Stripe.
 
-- **Security.** TLS at Nginx; private media (contract PDFs, student photos, session recordings) served only via short-lived **CloudFront signed URLs** minted after an authz check, buckets locked down with Origin Access Control; **materials and recordings are view-only / non-downloadable** (signed URLs delivered with inline content-disposition into an in-app viewer/player that disables download); recording-metadata and student-profile access enforced by Supabase Row-Level Security; secrets in environment, not image.
+- **Security.** TLS at Nginx; private media (contract PDFs, student photos, session recordings) served only via short-lived **CloudFront signed URLs** minted after an authz check, buckets locked down with Origin Access Control; **materials and recordings are view-only / non-downloadable** (signed URLs delivered with inline content-disposition into an in-app viewer/player that disables download); recording-metadata and student-profile access enforced by Postgres Row-Level Security; secrets in environment, not image.
 
-- **Observability.** At this scale there is **nothing dedicated to build for observability** — the platform relies on the host/managed-service default logs (Supabase, Stripe dashboard, the VM's container logs). A purpose-built observability stack is unjustified at 300 users.
+- **Observability.** At this scale there is **nothing dedicated to build for observability** — the platform relies on the host/managed-service default logs (Supabase Auth, Stripe dashboard, the VM's Postgres and container logs). A purpose-built observability stack is unjustified at 300 users.
 
 ### 2.3 Contract Lifecycle
 
@@ -120,7 +120,7 @@ The system is a **modular monolith** (Node.js + TypeScript) on a single **Hetzne
 
 **1. Frontend — React + TypeScript SPA.** A single-page app built and served as static assets by Nginx, which also terminates TLS and reverse-proxies `/api` to the Node backend. All user interaction (discovery, contract negotiation, messaging, the in-app PDF viewer, the video/recording screens, the teacher earnings view) lives here. It holds a Supabase-issued JWT and sends it on every API call.
 
-**2. Auth module.** Delegates identity to **Supabase Auth** (email/password + Google OAuth). The backend verifies the Supabase JWT and maps it to a `users` row and a role: **admin** (internal dashboard), **student**, or **teacher**. Role is chosen at signup; admin is internal-only. Student-profile rows are protected by Supabase Row-Level Security.
+**2. Auth module.** Delegates identity to **Supabase Auth** (email/password + Google OAuth). The backend verifies the Supabase JWT and maps it to a `users` row and a role: **admin** (internal dashboard), **student**, or **teacher**. Role is chosen at signup; admin is internal-only. The Supabase user id is copied into `users.id` at signup (the relational DB is self-hosted, so there is no `auth.users` FK). Student-profile rows are protected by Postgres Row-Level Security.
 
 **3. Contract module.** Owns the `INITIATED → PROPOSED → REVISION → ACCEPTED → ACTIVE` state machine and the contract's `payment_options`. Approval and first-charge clearing are committed together so a contract is never `active` without cleared payment. On establishment it triggers the contract-established email; on a new student request it triggers the teacher-notification email.
 
@@ -170,7 +170,7 @@ flowchart TD
     Messaging --> Contract[Contract Module\npropose → approve loop]
     Contract --> Stripe[Stripe Billing\nfull upfront or monthly slices]
     Stripe -->|payment cleared| Active[Contract ACTIVE]
-    Active --> DB[(Supabase DB\ncontracts table: ACCEPTED → ACTIVE\npayments table: PENDING → COMPLETED)]
+    Active --> DB[(Postgres (self-hosted)\ncontracts table: ACCEPTED → ACTIVE\npayments table: PENDING → COMPLETED)]
 ```
 
 #### Flow 3 — Session Delivery & Recording
@@ -182,7 +182,7 @@ flowchart TD
 
     DailySDK -->|session ends\nrecording opted in| Webhook[recording-ready webhook]
     Webhook --> S3[(AWS S3\nrecording stored)]
-    S3 --> Metadata[(Supabase DB\nsession_recordings row written)]
+    S3 --> Metadata[(Postgres (self-hosted)\nsession_recordings row written)]
 
     Student -->|wants to replay| Dash[Student Dashboard]
     Dash -->|API authz check| SignedURL[CloudFront Signed URL\nview-only, no download]
@@ -211,7 +211,7 @@ flowchart TD
     Post --> Insert[learning_requests row inserted\nstatus = OPEN\nexpires_at = now + 7 days]
     Insert --> Query[Backend queries teacher_profiles\nWHERE subjects contains requested subject\nEXCLUDES teachers with ACTIVE contract with student]
     Query --> FanOut[Fan-out: insert learning_request_notifications\none row per matched teacher]
-    FanOut --> Realtime[Supabase Realtime pushes to online teachers\nOffline teachers see it on next dashboard load]
+    FanOut --> Realtime[Realtime (Postgres LISTEN/NOTIFY) pushes to online teachers\nOffline teachers see it on next dashboard load]
 
     Realtime --> Teacher[Teacher views broadcast\nStudent profile temporarily visible]
     Teacher --> Respond[Teacher responds via contract flow\nINITIATED → PROPOSED with broadcast_request_id]
@@ -355,7 +355,7 @@ Both are internal — not called by the frontend. Stripe webhook drives payment/
 Rules:
 - A student may have multiple open broadcasts simultaneously (different subjects allowed).
 - **Blocked if < 4 delivered sessions for same subject:** `POST /api/broadcast-requests` returns `400` if the student has an `ACTIVE` contract for the requested subject with fewer than 4 delivered sessions. Exception: allowed immediately if the prior contract for that subject was cancelled due to an admin-approved legitimate reason on the teacher's side.
-- Fan-out on insert: backend queries `teacher_profiles WHERE subjects @> [subject]`, excludes teachers with an `ACTIVE` contract with that student, inserts one `learning_request_notifications` row per matched teacher, Supabase Realtime delivers to online teachers instantly.
+- Fan-out on insert: backend queries `teacher_profiles WHERE subjects @> [subject]`, excludes teachers with an `ACTIVE` contract with that student, inserts one `learning_request_notifications` row per matched teacher, Realtime (Postgres LISTEN/NOTIFY) delivers to online teachers instantly.
 - Teacher responds via the existing contract `INITIATED → PROPOSED` flow with `broadcast_request_id` attached.
 - Student profile temporarily readable by all teachers with a `PENDING` notification row for that request (RLS); reverts on terminal state.
 - On `DELETE`: request → `CANCELLED`; all related notifications → `CANCELLED`; any in-progress proposals from teachers marked invalid.
@@ -379,7 +379,7 @@ Rules:
 
 ## 5. Data Model
 
-Postgres (Supabase). Money stored in **integer minor units** (cents); all timestamps **UTC `timestamptz`**; teacher availability also stores the teacher's IANA timezone for the "(originally …)" display. Student-profile rows protected by **RLS**: readable only by the owner and by a teacher joined through an `active` contract.
+Postgres (self-hosted on the Hetzner VPS, fronted by pgbouncer in transaction mode; Supabase retained for Auth only). Money stored in **integer minor units** (cents); all timestamps **UTC `timestamptz`**; teacher availability also stores the teacher's IANA timezone for the "(originally …)" display. Student-profile rows protected by **RLS**: readable only by the owner and by a teacher joined through an `active` contract.
 
 Key tables (selected columns).
 
@@ -576,13 +576,47 @@ RLS on `student_recommendations`: readable only by teachers who have a contract 
 
 RLS on `learning_request_notifications`: teachers see only their own rows. Student profile readable by teachers with a `PENDING` row for that request — reverts to default RLS on terminal request state.
 
+### Row-Level Security (tenant isolation)
+
+Two layers enforce "user A cannot read/write user B's data": (1) **app-layer** `where … = user_id` is the primary filter; (2) **RLS is the backstop** that holds even if an app-layer filter is forgotten. The backend connects as a **non-`BYPASSRLS` role** (`nisbah_users` for all student/teacher traffic, `nisbah_admin` for the admin dashboard); a separate `nisbah_migrator` owns the schema, runs DDL/migrations, and is the only identity that bypasses RLS. Per authenticated request the central DB wrapper runs, inside one transaction (safe under pgbouncer transaction-mode pooling, auto-clears at commit):
+
+```
+begin;
+set local app.user_id   = <uuid from verified JWT>;
+set local app.user_role = <role from verified JWT>;
+… queries …
+commit;
+```
+
+Policies read these via two **`STABLE`** helpers: `app_uid()` = `nullif(current_setting('app.user_id', true), '')::uuid` (missing → NULL → fail-closed, zero rows) and `app_is_admin()` = `current_setting('app.user_role', true) = 'admin'`. Every RLS table is `enable`d **and** `force`d (so the table owner is also subject to policies). RLS is per-row, not per-column — a passing row exposes all its columns; column-hiding (e.g. `payout_batches.net_profit_cents`) is done by **API column-projection**, not RLS. **"writes = system"** below means rows written only by trusted server paths (Stripe webhooks, scheduler, fan-out, media pipeline) running as the migrator/system identity that bypasses RLS — no `req.user`, so no policy applies.
+
+RLS is **off** (app-layer filtering + public/low-sensitivity data only) on: `users`, `teacher_profiles`, `availability`, `teacher_reviews`.
+
+RLS is **on** for the rest:
+
+| Table | SELECT | INSERT | UPDATE | DELETE |
+|---|---|---|---|---|
+| `student_profiles` | owner `app_uid()=user_id` **OR** teacher in `ACTIVE` contract **OR** teacher with `PENDING` notif on the student's `OPEN` request | own (`WITH CHECK app_uid()=user_id`); created later via form (not at signup) | own | — |
+| `learning_requests` | own `app_uid()=student_id` **OR** matched-teacher (EXISTS into notifications) | own | own | — (system flips `FULFILLED`/`EXPIRED`) |
+| `contracts` | participants `app_uid() IN (student_id, teacher_id)` (indexed, cheap) | student `WITH CHECK app_uid()=student_id` | participants | — (cancel via status) |
+| `contract_plan_revisions` | EXISTS-into-`contracts` (participant) | proposer **and** participant | — (immutable) | — |
+| `payments` | **student-only** EXISTS-into-`contracts` | writes = system/Stripe | writes = system | — |
+| `payout_batches` | `app_uid()=teacher_id` (`net_profit_cents` hidden by API projection) | writes = system | writes = system | — |
+| `sessions` | `app_uid()=teacher_id` **OR** student EXISTS-into-`contracts` | writes = system/scheduler | reschedule = system path | — |
+| `session_recordings` | **student-only** EXISTS via `sessions`+`contracts` (recordings = students only) | writes = media pipeline | writes = system | — |
+| `messages` | EXISTS-participant (via `contracts`) | `WITH CHECK app_uid()=sender_id` **and** participant | — (immutable) | — (ML corpus) |
+| `student_recommendations` | teacher with contract in `INITIATED\|PROPOSED\|REVISION\|ACCEPTED\|ACTIVE` (EXISTS); student does **not** read own | teacher `WITH CHECK app_uid()=teacher_id` | — (immutable) | — |
+| `learning_request_notifications` | `app_uid()=teacher_id` | fan-out = system | own `app_uid()=teacher_id` (dismiss / not-interested) | — |
+
+Cost note: owner-equality policies on indexed columns are cheap (use anywhere). `EXISTS`-subquery policies run per-row and are accepted on cold tables; they are flagged on the hot read paths (`sessions`, `messages`) for later optimization if profiling shows pressure. `nisbah_admin` reach is an open item — admin access is currently via the bypass path, not per-policy `app_is_admin()` branches.
+
 No sharding/partitioning — a single small Postgres instance is far within capacity at this scale.
 
 ## 6. Trade-offs & Alternatives
 
-- **Modular monolith on one Hetzner VPS → vs microservices.** *Why:* product-market validation stage — one deployable, two Docker containers (frontend + backend) behind Nginx. Vertical scaling is the intended next step; the domain has no independent-scaling or fault-isolation requirements that would justify microservices. *Gave up:* SPOF — accepted because all durable state is in Supabase / S3 / Stripe and recovery is a daily-image rebuild.
+- **Modular monolith on one Hetzner VPS → vs microservices.** *Why:* product-market validation stage — one deployable, two Docker containers (frontend + backend) behind Nginx. Vertical scaling is the intended next step; the domain has no independent-scaling or fault-isolation requirements that would justify microservices. *Gave up:* SPOF — the self-hosted Postgres now also lives on the VM, so recovery is a daily-image rebuild plus restore from off-VM Postgres backups; media and payment records remain off-VM in S3 / Stripe.
 
-- **Postgres (Supabase-managed) → vs a NoSQL store or self-hosted Postgres.** *Why:* (a) **ACID** — contracts and payments are fully structured; a partial write or lost payment row is unacceptable; (b) **Supabase** — managed DB + built-in auth provider (email/password, Google OAuth, JWT, RLS) removes an entire ops surface. *Gave up:* some vendor control — mitigated since the underlying data is standard, portable Postgres.
+- **Self-hosted Postgres on the VPS (fronted by pgbouncer) → vs Supabase-managed Postgres or a NoSQL store.** *Why:* (a) **ACID** — contracts and payments are fully structured; a partial write or lost payment row is unacceptable; (b) **latency + cost** — running Postgres in a container next to the backend removes a network hop and the managed-DB fee at launch scale; pgbouncer in transaction mode keeps connections bounded. Supabase is retained for **Auth only** (JWT issuance), so identity stays a managed surface while the data layer is owned. *Gave up:* the DB ops surface — backups, upgrades, and Realtime (now Postgres `LISTEN/NOTIFY`) are self-managed, and the DB becomes a VM SPOF. Accepted at PMV scale; the plan is to move back to a managed/replicated Postgres when scaling out. Data stays standard, portable Postgres.
 
 - **All media (photos, PDFs, intro videos, recordings) in S3; only the object key in Postgres → per-type buckets / IA tiering.** *Why:* One Standard bucket keeps operations simple; storage cost is a rounding error at this scale. *Gave up:* marginal savings from IA tiering on cold objects — deferred to [Section 8](#8-future-considerations).
 
@@ -596,7 +630,8 @@ No sharding/partitioning — a single small Postgres instance is far within capa
 |---|---|---|---|
 | Daily.co — video | \$0.0040 / user-min | 14,000 billable user-min (24,000 − 10,000 free) | **\$56.00** |
 | Daily.co — cloud recording | \$0.01349 / recording-min ⁴ | ≤12,000 recording-min (opt-in; bills only on enabled sessions) | **≤\$161.88** |
-| Supabase — database | \$25 | flat | **\$25.00** |
+| Supabase — Auth only | free tier | flat | **\$0** |
+| Self-hosted Postgres + pgbouncer | runs in a container on the VPS | — | **\$0** (incl. in Hetzner) |
 | AWS CloudFront | ~\$0.085 / GB egress + request fees (pay-as-you-go) | ~120 GB/mo³ (incl. recording playback) | **~\$10.00** |
 | AWS S3 (Standard) | \$0.023 / GB-mo | ~150 GB resident¹ (incl. recordings) | **~\$3.50** |
 | Hetzner VPS (2 vCPU / 4 GB) | ~€6–8/month | flat | **~\$9.65–\$12.85** |
@@ -604,15 +639,16 @@ No sharding/partitioning — a single small Postgres instance is far within capa
 | Resend — transactional email | free tier (3,000 emails/mo, 100/day cap²) | ~300–400 emails/mo at this scale | **\$0** |
 | PII filtering — regex (Layer 1) | in-process | — | **\$0** |
 | PII filtering — AWS Comprehend (Layer 2) | \$0.0001 / unit (min 3 units / call) | ~3,000–5,000 calls/mo (all in-app messages passing Layer 1) | **~\$1.50** |
-| **Platform run-rate** | | | **≈ \$107 / month** (no recording opt-in) **to ≈ \$269 / month** (full opt-in) |
+| **Platform run-rate** | | | **≈ \$82 / month** (no recording opt-in) **to ≈ \$244 / month** (full opt-in) |
 | Stripe | 3.7% + \$0.30 / charge | per transaction | *pass-through⁵* |
 
 - **Daily.co — video.** Powers all 1:1 live sessions. 10,000 free participant-minutes/month; beyond that billed per user-minute (both participants count). At 200 session-hours, 14,000 minutes are billable. Scales directly with delivered sessions.
 - **Daily.co — cloud recording.** Opt-in per contract (default off) — billed only for sessions where `recording_enabled = true`. The $161.88 ceiling assumes every session is recorded; at launch (default off) cost starts near $0. Confirm rate against Daily's live price list before relying on this figure.
-- **Supabase.** Managed Postgres + built-in auth (email/password, Google OAuth, JWT, RLS). Pro plan is flat $25/month — covers the DB, auth, and realtime at this scale.
+- **Supabase — Auth only.** Used solely as the identity provider (email/password, JWT issuance); the relational database and Realtime are no longer on Supabase. At ~300 users this fits the free tier — **$0**.
+- **Self-hosted Postgres + pgbouncer.** Runs as a container on the same Hetzner VPS, so it adds no separate line item; it consumes VM CPU/RAM and shifts backups/upgrades to self-managed (factored into the Hetzner sizing).
 - **AWS CloudFront.** CDN fronting S3 — serves profile photos, intro videos, PDFs, and recording playback via signed URLs (view-only, no download). Pay-as-you-go; ~$10/month at moderate adoption, lower at launch before recording ramps.
 - **AWS S3.** Stores all media (photos, PDFs, intro videos, recordings) — only the object key lives in Postgres. ~$3.50/month for ~150 GB. Footprint bounded by purge-on-terminal (recordings drop at contract `completed`/`cancelled`).
-- **Hetzner VPS.** Single 2 vCPU / 4 GB VM running frontend + backend containers behind Nginx. Flat ~$9.65–$12.85/month. SPOF accepted at PMV stage; all durable state is off-VM (Supabase / S3 / Stripe).
+- **Hetzner VPS.** Single VM running frontend + backend + self-hosted Postgres (+ pgbouncer) containers behind Nginx. The added DB load means 2 vCPU / 4 GB is the floor — size up if Postgres + the app contend. Flat ~$9.65–$12.85/month at current sizing. SPOF accepted at PMV stage; the relational DB now lives on the VM (protected by off-VM backups), while media and payment records stay off-VM (S3 / Stripe).
 - **Cloudflare.** Free tier — reverse proxy, DDoS protection, edge cache for static assets, hides server IP. No cost at this scale.
 - **Resend.** Transactional email (contract established, payout sent, teacher approached). Free tier: 3,000 emails/month, **100 emails/day cap**. At ~300–400 emails/month this fits, but the 100/day cap is tight on the 28th (up to 100 payout emails in one batch). Upgrade to Pro ($20/mo) if that becomes an issue.
 - **PII regex (Layer 1).** In-process function — runs inside the backend on every message. No external call, no cost.
